@@ -48,10 +48,12 @@ export function classifyApproval(a: Approval): Finding {
       `This spender is flagged${a.spender.label ? ` (${a.spender.label})` : ""}. Revoke its access to your ${a.asset}.`);
   }
 
-  // 5. Permit2 universal-approval layer.
+  // 5. Permit2 universal-approval layer. This is the STANDARD Uniswap setup, so it's
+  //    routine (MEDIUM) — the real exposure is the per-app allowances Permit2 holds
+  //    internally, which a normal approval scan can't see (enumeration is on the roadmap).
   if (a.spender.permit2) {
-    return f(a.unlimited ? "high" : "medium", "spender.permit2",
-      `This approves Permit2 (the universal-approval contract), which can hold its own per-app allowances a normal scan doesn't show — review your Permit2 allowances separately, and cap this if you don't use Permit2-based apps.`);
+    return f("medium", "spender.permit2",
+      `Routine Uniswap/Permit2 approval. The real risk isn't this grant — it's the per-app allowances Permit2 holds internally (which a normal scan can't see yet). Safe to keep if you use Uniswap; revoke if you don't.`);
   }
 
   // 6. NFT collection-wide approval.
@@ -67,8 +69,14 @@ export function classifyApproval(a: Approval): Finding {
   // 7. Unlimited ERC-20 allowance.
   if (a.unlimited) {
     if (!a.spender.verified) {
-      return f("high", "allowance.unlimited.unverified",
-        `Unlimited allowance to an unverified contract${stale ? `, untouched for ${a.lastUsedDaysAgo} days` : ""} — high exposure with no known identity. Revoke if you don't recognize it.`);
+      // Gate HIGH on real value at stake — a $0 dust token to an unknown contract is
+      // low-priority noise, not a top threat.
+      if (a.exposureUsd > 0) {
+        return f("high", "allowance.unlimited.unverified",
+          `Unlimited allowance to an unverified contract${stale ? `, untouched for ${a.lastUsedDaysAgo} days` : ""} — real funds exposed with no known identity. Revoke if you don't recognize it.`);
+      }
+      return f("low", "allowance.unlimited.unverified.dust",
+        `Unlimited allowance to an unverified contract, but no balance is currently exposed. Low priority — clear it if you don't recognize it.`);
     }
     return f("medium", "allowance.unlimited.verified",
       `Unlimited allowance to ${a.spender.label ?? "a known protocol"}. Routine for DeFi, but capping it limits damage if that contract is ever exploited.`);
@@ -100,7 +108,9 @@ export function scoreWallet(address: string, approvals: Approval[], delegation?:
   for (const fnd of findings) {
     counts[fnd.level]++;
     weighted += LEVEL_WEIGHT[fnd.level];
-    if (fnd.level === "critical" || fnd.level === "high") atRiskUsd += fnd.approval.exposureUsd;
+    // Total exposure = everything an approval could move (incl. trusted protocols), so the
+    // headline reflects real money (e.g. a large WETH→CoW grant), not just confirmed-bad rows.
+    atRiskUsd += fnd.approval.exposureUsd;
   }
 
   let score = Math.min(100, weighted);

@@ -105,3 +105,37 @@ export async function discoverViaEtherscan(owner: string, apiKey: string): Promi
 export function isPermit2(spender: string): boolean {
   return spender.toLowerCase() === PERMIT2_ADDRESS;
 }
+
+const verifyCache = new Map<string, { verified: boolean; name?: string }>();
+
+/** Is this contract source-verified on Etherscan? (kills "unverified" false positives
+ *  for legit-but-unlabeled contracts like DSProxy/Zora). Cached; needs the API key. */
+export async function sourceVerified(address: string, apiKey: string, chainId = 1): Promise<{ verified: boolean; name?: string }> {
+  const key = `${chainId}:${address.toLowerCase()}`;
+  const hit = verifyCache.get(key);
+  if (hit) return hit;
+  let out: { verified: boolean; name?: string } = { verified: false };
+  // Retry on Etherscan's 5/s rate limit (it returns result as a string, not the array),
+  // so a throttle blip doesn't silently mislabel a verified contract as "unverified".
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const qs = new URLSearchParams({ chainid: String(chainId), module: "contract", action: "getsourcecode", address, apikey: apiKey });
+      const res = await fetch(`${ETHERSCAN_V2}?${qs}`, { signal: AbortSignal.timeout(12000) });
+      const json = (await res.json()) as { status: string; result?: { SourceCode?: string; ContractName?: string }[] | string };
+      if (!Array.isArray(json.result)) {
+        // Rate-limited / transient — back off and retry.
+        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+        continue;
+      }
+      const r = json.result[0];
+      if (r && typeof r.SourceCode === "string" && r.SourceCode.length > 0) {
+        out = { verified: true, name: r.ContractName || undefined };
+      }
+      break; // got a real array answer (verified or not)
+    } catch {
+      break;
+    }
+  }
+  verifyCache.set(key, out);
+  return out;
+}

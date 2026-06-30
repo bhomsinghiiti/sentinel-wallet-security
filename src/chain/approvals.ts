@@ -9,7 +9,7 @@
 // Returns null only when discovery itself is unavailable, so the UI can be honest.
 
 import { rpcCall } from "./rpc.ts";
-import { discoverViaEtherscan, isPermit2, type DiscoveredPair } from "./etherscan.ts";
+import { discoverViaEtherscan, isPermit2, sourceVerified, type DiscoveredPair } from "./etherscan.ts";
 import { lookupKnown } from "../core/allowlist.ts";
 import { addressReputation, tokenReputation } from "./reputation.ts";
 import { getPrices } from "./prices.ts";
@@ -106,16 +106,28 @@ async function enrich(owner: string, base: { a: Approval; rawAllowance: bigint }
 
   const spenders = [...new Set(base.map((b) => b.a.spender.address))].slice(0, 40);
   const erc20Tokens = [...new Set(base.filter((b) => b.a.kind !== "nft").map((b) => b.a.token))].slice(0, 40);
+  // Spenders not already labeled by the allowlist → check Etherscan source-verification.
+  const unknownSpenders = [...new Set(base.filter((b) => !lookupKnown(b.a.spender.address)).map((b) => b.a.spender.address))].slice(0, 40);
+  const key = process.env.ETHERSCAN_KEY;
 
-  // 2. Reputation + prices + balances, in parallel.
-  const [repBySpender, priceByToken, balByToken, hpByToken] = await Promise.all([
+  // 2. Reputation + prices + balances + decimals + source-verification, in parallel.
+  const [repBySpender, priceByToken, balByToken, hpByToken, decByToken, verBySpender] = await Promise.all([
     mapAsync(spenders, (s) => addressReputation(s)),
     getPrices(erc20Tokens),
     mapAsync(erc20Tokens, (t) => balanceOf(owner, t)),
     mapAsync(erc20Tokens, (t) => tokenReputation(t)),
+    mapAsync(erc20Tokens, (t) => tokenDecimals(t)),
+    key ? mapAsync(unknownSpenders, (s) => sourceVerified(s, key), 3) : Promise.resolve(new Map()),
   ]);
 
   for (const { a, rawAllowance } of base) {
+    // Source-verified (but unlabeled) contracts → verified, so they read MEDIUM not HIGH.
+    const ver = verBySpender.get(a.spender.address) as { verified: boolean; name?: string } | undefined;
+    if (ver?.verified) {
+      a.spender.verified = true;
+      if (!a.spender.label && ver.name) a.spender.label = ver.name;
+    }
+    // Reputation overrides everything: a flagged spender is never "verified".
     const rep = repBySpender.get(a.spender.address);
     if (rep?.malicious) {
       a.spender.knownDrainer = true;
@@ -126,19 +138,30 @@ async function enrich(owner: string, base: { a: Approval; rawAllowance: bigint }
     if (a.kind !== "nft") {
       if (hpByToken.get(a.token)?.honeypot) a.honeypot = true;
       const price = priceByToken.get(a.token.toLowerCase());
+      const decimals = price?.decimals ?? decByToken.get(a.token) ?? null;
       const bal = balByToken.get(a.token);
       if (price && bal !== undefined && bal !== null) {
         const exposedRaw = rawAllowance < bal ? rawAllowance : bal; // min(allowance, balance)
         a.exposureUsd = (Number(exposedRaw) / 10 ** price.decimals) * price.price;
       }
+      // Human-readable allowance (never raw hex).
+      a.allowance = a.unlimited ? "Unlimited" : fmtAmount(rawAllowance, decimals);
     }
   }
 }
 
+/** Format a raw token amount with decimals into something a human reads. */
+function fmtAmount(raw: bigint, decimals: number | null): string {
+  if (decimals == null) return "Limited";
+  const v = Number(raw) / 10 ** decimals;
+  if (v === 0) return "0";
+  if (v < 0.0001) return "<0.0001";
+  return v.toLocaleString("en-US", { maximumFractionDigits: 4 });
+}
+
 /** Run an async fn over keys, returning a Map<key, result>. Bounded concurrency. */
-async function mapAsync<T>(keys: string[], fn: (k: string) => Promise<T>): Promise<Map<string, T>> {
+async function mapAsync<T>(keys: string[], fn: (k: string) => Promise<T>, CONC = 8): Promise<Map<string, T>> {
   const out = new Map<string, T>();
-  const CONC = 8;
   for (let i = 0; i < keys.length; i += CONC) {
     const slice = keys.slice(i, i + CONC);
     const results = await Promise.all(slice.map(fn));
@@ -155,6 +178,23 @@ async function balanceOf(owner: string, token: string): Promise<bigint | null> {
   } catch {
     return null;
   }
+}
+
+const SEL_DECIMALS = "0x313ce567"; // decimals()
+const decCache = new Map<string, number | null>();
+async function tokenDecimals(token: string): Promise<number | null> {
+  const k = token.toLowerCase();
+  if (decCache.has(k)) return decCache.get(k) ?? null;
+  let d: number | null = null;
+  try {
+    const res = (await rpcCall("eth_call", [{ to: token, data: SEL_DECIMALS }, "latest"])) as string;
+    const v = toBigInt(res);
+    if (v !== null && v >= 0n && v <= 36n) d = Number(v);
+  } catch {
+    /* unknown */
+  }
+  decCache.set(k, d);
+  return d;
 }
 
 /** Fallback discovery via raw eth_getLogs (free RPCs usually reject full history → null). */
@@ -189,10 +229,22 @@ async function discoverViaRawLogs(owner: string): Promise<DiscoveredPair[] | nul
 async function safeSymbol(token: string): Promise<string> {
   try {
     const res = (await rpcCall("eth_call", [{ to: token, data: SEL_SYMBOL }, "latest"])) as string;
-    return decodeString(res) || token.slice(0, 8);
+    return sanitizeSymbol(decodeString(res), token);
   } catch {
-    return token.slice(0, 8);
+    return shortAddr(token);
   }
+}
+/** Strip control/zero-width/non-printable chars (scam tokens hide behind them); fall
+ *  back to a short address so a finding never renders with a blank or garbled name. */
+function sanitizeSymbol(sym: string, token: string): string {
+  const clean = (sym || "")
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\ufeff]/g, "")
+    .trim()
+    .slice(0, 24);
+  return clean.length ? clean : shortAddr(token);
+}
+function shortAddr(a: string): string {
+  return a.length >= 10 ? a.slice(0, 6) + "…" + a.slice(-4) : a;
 }
 function shortHex(h: string): string {
   return h.length > 14 ? h.slice(0, 10) + "…" : h;

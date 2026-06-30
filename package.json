@@ -8,9 +8,9 @@
     "node": ">=22.6.0"
   },
   "scripts": {
-    "web": "node src/web/server.ts",
+    "web": "node --env-file-if-exists=.env src/web/server.ts",
     "scan": "node src/cli/scan.ts",
-    "scan:live": "node src/cli/scan.ts --live",
+    "scan:live": "node --env-file-if-exists=.env src/cli/scan.ts --live",
     "test": "node --test src/**/*.test.ts"
   },
   "keywords": ["ethereum", "security", "approvals", "revoke", "eip-7702", "wallet"],

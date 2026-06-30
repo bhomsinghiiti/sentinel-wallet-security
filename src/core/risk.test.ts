@@ -74,10 +74,10 @@ test("NFT approveAll to verified marketplace → medium", () => {
   assert.equal(f.rule, "nft.approveAll.verified");
 });
 
-test("Permit2 spender (unlimited) → high", () => {
+test("Permit2 spender → medium (routine Uniswap flow, not alarmist)", () => {
   const f = classifyApproval(appr({ unlimited: true, spender: { address: "0x000000000022d473030f116ddee9f6b43ac78ba3", verified: true, flagged: false, knownDrainer: false, permit2: true } }));
   assert.equal(f.rule, "spender.permit2");
-  assert.equal(f.level, "high");
+  assert.equal(f.level, "medium");
 });
 
 test("bounded + stale (>180d) → medium", () => {
@@ -112,10 +112,16 @@ test("malicious delegation forces CRITICAL band even with no approvals", () => {
   assert.ok(r.score >= 95);
 });
 
-test("atRiskUsd sums only critical + high exposure", () => {
+test("unlimited to unverified with $0 exposure → low (dust, not HIGH)", () => {
+  const f = classifyApproval(appr({ unlimited: true, exposureUsd: 0, spender: { address: "0x1", verified: false, flagged: false, knownDrainer: false } }));
+  assert.equal(f.level, "low");
+  assert.equal(f.rule, "allowance.unlimited.unverified.dust");
+});
+
+test("atRiskUsd reflects TOTAL exposure (incl. trusted protocols), not just critical/high", () => {
   const r = scoreWallet("0xW", [
     appr({ spender: { address: "0x1", verified: false, flagged: false, knownDrainer: true }, exposureUsd: 1000 }), // critical
     appr({ unlimited: false, lastUsedDaysAgo: 2, spender: { address: "0x2", verified: true, flagged: false, knownDrainer: false }, exposureUsd: 500 }), // low
   ]);
-  assert.equal(r.atRiskUsd, 1000);
+  assert.equal(r.atRiskUsd, 1500);
 });
