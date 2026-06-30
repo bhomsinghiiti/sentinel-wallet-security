@@ -51,7 +51,7 @@ never moves your money.**
 Needs **Node ≥ 22.6** (runs TypeScript directly — no build, no dependencies).
 
 ```sh
-npm test                                    # 28 tests, zero dependencies
+npm test                                    # 29 tests, zero dependencies
 npm run scan                                # offline demo (the output above)
 node src/cli/scan.ts --live 0xYourAddress   # real on-chain EIP-7702 delegation check
 ```
