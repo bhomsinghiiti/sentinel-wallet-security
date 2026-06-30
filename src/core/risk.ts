@@ -1,211 +1,119 @@
-// Sentinel risk engine — the product's brain, and intentionally pure (no I/O).
+// Sentinel risk engine — pure (no I/O), deterministic, unit-tested.
 //
-// This is the part the research said a human must own: the rules that decide what
-// "risky" means. Everything here is deterministic and unit-tested. A scanner feeds
-// it Approvals; it returns Findings + a WalletReport. Swapping the data source
-// (live RPC, fixture, future indexer) never touches these rules.
+// Philosophy (matching how real scanners avoid crying wolf): CRITICAL is reserved for
+// CONFIRMED danger — a known drainer, a flagged/sanctioned spender, a honeypot token, a
+// malicious account delegation. An unlimited approval to an UNKNOWN contract is HIGH (worth
+// fixing, not confirmed bad); an unlimited approval to a KNOWN/trusted protocol is MEDIUM
+// (routine, capping is best practice). The judgment data (verified/flagged/knownDrainer/
+// honeypot) is supplied by the reputation + allowlist layer; this file only reasons over it.
 
-import type {
-  Approval,
-  Finding,
-  RiskLevel,
-  WalletReport,
-  RiskBand,
-  DelegationStatus,
-} from "./types.ts";
+import type { Approval, Finding, RiskLevel, WalletReport, RiskBand, DelegationStatus } from "./types.ts";
 
-const STALE_DAYS = 365; // an approval unused for a year is a forgotten liability
+const STALE_DAYS = 365;
 const STALE_SOFT_DAYS = 180;
 
-const LEVEL_WEIGHT: Record<RiskLevel, number> = {
-  critical: 40,
-  high: 15,
-  medium: 5,
-  low: 1,
-  safe: 0,
-};
+const LEVEL_WEIGHT: Record<RiskLevel, number> = { critical: 40, high: 15, medium: 5, low: 1, safe: 0 };
+const LEVEL_RANK: Record<RiskLevel, number> = { critical: 0, high: 1, medium: 2, low: 3, safe: 4 };
 
-/**
- * Classify a single approval. Order matters: the worst applicable rule wins.
- * Rules are deliberately conservative and explainable — we present risk SIGNALS,
- * not verdicts, and never claim something is "safe" we can't justify.
- */
+/** Classify a single approval. Worst applicable rule wins (top to bottom). */
 export function classifyApproval(a: Approval): Finding {
-  const f = (level: RiskLevel, rule: string, reason: string): Finding => ({
-    approval: a,
-    level,
-    rule,
-    reason,
-  });
+  const f = (level: RiskLevel, rule: string, reason: string): Finding => ({ approval: a, level, rule, reason });
+  const stale = (a.lastUsedDaysAgo ?? 0) >= STALE_DAYS;
 
-  // 1. EIP-7702 account delegation to a known sweeper — the highest danger.
+  // 1. EIP-7702 account delegation.
   if (a.kind === "delegation") {
     if (a.spender.knownDrainer || a.spender.flagged) {
-      return f(
-        "critical",
-        "deleg.malicious",
-        "Your account is delegated to a known sweeper. Any funds that arrive can be auto-forwarded to an attacker with no further signature. Most tools can't remove this — reset the delegation to the zero address.",
-      );
+      return f("critical", "deleg.malicious",
+        "Your account is delegated to a known sweeper. Any funds that arrive can be auto-forwarded to an attacker with no further signature. Reset the delegation to the zero address.");
     }
-    return f(
-      "high",
-      "deleg.unknown",
-      "Your account delegates its code via EIP-7702 to a contract we don't recognize. Confirm you set this intentionally; if not, reset it.",
-    );
+    return f("high", "deleg.unknown",
+      "Your account delegates its code via EIP-7702 to a contract we don't recognize. Confirm you set this intentionally; if not, reset it.");
   }
 
-  // 2. Any approval to a known drainer cluster.
+  // 2. The token itself is a honeypot/scam token.
+  if (a.honeypot) {
+    return f("critical", "token.honeypot",
+      `${a.asset} is flagged as a honeypot/scam token. Revoke this approval and avoid interacting with it.`);
+  }
+
+  // 3. Spender is a known drainer cluster.
   if (a.spender.knownDrainer) {
-    return f(
-      "critical",
-      "spender.drainer",
-      `The spender matches a known wallet-drainer cluster. Your ${a.asset} can be taken at any moment — revoke now.`,
-    );
+    return f("critical", "spender.drainer",
+      `The spender is a known wallet drainer${a.spender.label ? ` (${a.spender.label})` : ""}. Your ${a.asset} can be taken at any moment — revoke now.`);
   }
 
-  // 3. NFT collection-wide approval to an unverified / flagged contract.
-  if (a.kind === "nft" && (!a.spender.verified || a.spender.flagged)) {
-    return f(
-      "critical",
-      "nft.approveAll.unverified",
-      `setApprovalForAll grants control of your ENTIRE ${a.asset} collection to an unverified contract — the most common NFT-theft vector. Revoke it.`,
-    );
-  }
-
-  // 4. Flagged spender (on a risk/blocklist) holding any allowance.
+  // 4. Spender is flagged (scam/phishing/sanctioned blocklist).
   if (a.spender.flagged) {
-    return f(
-      "critical",
-      "spender.flagged",
-      `This spender is on a risk/blocklist (phishing or scam). Revoke its access to your ${a.asset}.`,
-    );
+    return f("critical", "spender.flagged",
+      `This spender is flagged${a.spender.label ? ` (${a.spender.label})` : ""}. Revoke its access to your ${a.asset}.`);
   }
 
-  // 4b. Approval to the Permit2 universal-approval contract — surface the hidden
-  //     second layer (per-dApp allowances inside Permit2 a plain scan can't see).
+  // 5. Permit2 universal-approval layer.
   if (a.spender.permit2) {
-    return f(
-      a.unlimited ? "high" : "medium",
-      "spender.permit2",
-      `This approves Permit2 (the universal-approval contract). Permit2 can then hold its own per-app allowances that a normal scan doesn't show — review your Permit2 allowances separately, and cap this if you don't actively use Permit2-based apps.`,
-    );
+    return f(a.unlimited ? "high" : "medium", "spender.permit2",
+      `This approves Permit2 (the universal-approval contract), which can hold its own per-app allowances a normal scan doesn't show — review your Permit2 allowances separately, and cap this if you don't use Permit2-based apps.`);
   }
 
-  // 5. Unlimited allowance to an unverified contract.
-  if (a.unlimited && !a.spender.verified) {
-    return f(
-      "critical",
-      "allowance.unlimited.unverified",
-      `Unlimited allowance to an unverified contract${
-        isStale(a) ? `, untouched for ${a.lastUsedDaysAgo} days` : ""
-      } — maximum exposure with no accountability. Revoke it.`,
-    );
+  // 6. NFT collection-wide approval.
+  if (a.kind === "nft") {
+    if (a.spender.verified) {
+      return f("medium", "nft.approveAll.verified",
+        `Collection-wide approval to ${a.spender.label ?? "a known marketplace"}. Legitimate, but it covers your ENTIRE ${a.asset} collection — revoke if you no longer use it.`);
+    }
+    return f("high", "nft.approveAll.unverified",
+      `setApprovalForAll grants control of your ENTIRE ${a.asset} collection to an unverified contract — a common NFT-theft vector. Revoke if unexpected.`);
   }
 
-  // 6. Unlimited allowance to a verified contract but forgotten (stale).
-  if (a.unlimited && isStale(a)) {
-    return f(
-      "critical",
-      "allowance.unlimited.stale",
-      `Unlimited allowance unused for ${a.lastUsedDaysAgo} days — a forgotten approval sitting at full exposure. Clear it.`,
-    );
-  }
-
-  // 7. Unlimited allowance to a verified, in-use contract — still worth capping.
+  // 7. Unlimited ERC-20 allowance.
   if (a.unlimited) {
-    return f(
-      "high",
-      "allowance.unlimited.verified",
-      `Unlimited allowance to ${
-        a.spender.label ?? "a verified contract"
-      }. Legitimate, but if that contract is ever exploited your whole balance is reachable — best practice is to cap it.`,
-    );
+    if (!a.spender.verified) {
+      return f("high", "allowance.unlimited.unverified",
+        `Unlimited allowance to an unverified contract${stale ? `, untouched for ${a.lastUsedDaysAgo} days` : ""} — high exposure with no known identity. Revoke if you don't recognize it.`);
+    }
+    return f("medium", "allowance.unlimited.verified",
+      `Unlimited allowance to ${a.spender.label ?? "a known protocol"}. Routine for DeFi, but capping it limits damage if that contract is ever exploited.`);
   }
 
-  // 8. Bounded allowance but stale to a trusted protocol.
+  // 8. Bounded but stale.
   if ((a.lastUsedDaysAgo ?? 0) >= STALE_SOFT_DAYS) {
-    return f(
-      "medium",
-      "allowance.bounded.stale",
-      `A capped approval unused for ${a.lastUsedDaysAgo} days. Low urgency, but worth clearing.`,
-    );
+    return f("medium", "allowance.bounded.stale", `A capped approval unused for ${a.lastUsedDaysAgo} days. Low urgency, but worth clearing.`);
   }
 
   // 9. Bounded, recent, verified — healthy.
   if (a.spender.verified) {
-    return f(
-      "low",
-      "allowance.healthy",
-      `An exact-amount approval to ${
-        a.spender.label ?? "a verified contract"
-      }, used recently — a healthy approval.`,
-    );
+    return f("low", "allowance.healthy", `An exact-amount approval to ${a.spender.label ?? "a verified contract"}, used recently — a healthy approval.`);
   }
 
-  // 10. Bounded but unverified spender — mild caution.
-  return f(
-    "medium",
-    "allowance.bounded.unverified",
-    `A bounded approval to an unverified contract. Clear it if you no longer use it.`,
-  );
+  // 10. Bounded to an unverified spender — mild caution.
+  return f("medium", "allowance.bounded.unverified", `A bounded approval to an unverified contract. Clear it if you no longer use it.`);
 }
-
-function isStale(a: Approval): boolean {
-  return (a.lastUsedDaysAgo ?? 0) >= STALE_DAYS;
-}
-
-const LEVEL_RANK: Record<RiskLevel, number> = {
-  critical: 0,
-  high: 1,
-  medium: 2,
-  low: 3,
-  safe: 4,
-};
 
 /** Score a wallet from its approvals (+ optional delegation status). Pure. */
-export function scoreWallet(
-  address: string,
-  approvals: Approval[],
-  delegation?: DelegationStatus,
-): WalletReport {
+export function scoreWallet(address: string, approvals: Approval[], delegation?: DelegationStatus): WalletReport {
   const findings = approvals
     .map(classifyApproval)
-    .sort(
-      (a, b) =>
-        LEVEL_RANK[a.level] - LEVEL_RANK[b.level] ||
-        b.approval.exposureUsd - a.approval.exposureUsd,
-    );
+    .sort((a, b) => LEVEL_RANK[a.level] - LEVEL_RANK[b.level] || b.approval.exposureUsd - a.approval.exposureUsd);
 
-  const counts: Record<RiskLevel, number> = {
-    critical: 0,
-    high: 0,
-    medium: 0,
-    low: 0,
-    safe: 0,
-  };
+  const counts: Record<RiskLevel, number> = { critical: 0, high: 0, medium: 0, low: 0, safe: 0 };
   let weighted = 0;
   let atRiskUsd = 0;
-  for (const f of findings) {
-    counts[f.level]++;
-    weighted += LEVEL_WEIGHT[f.level];
-    if (f.level === "critical" || f.level === "high") {
-      atRiskUsd += f.approval.exposureUsd;
-    }
+  for (const fnd of findings) {
+    counts[fnd.level]++;
+    weighted += LEVEL_WEIGHT[fnd.level];
+    if (fnd.level === "critical" || fnd.level === "high") atRiskUsd += fnd.approval.exposureUsd;
   }
 
-  // Composite 0–100. A single critical alone should read as serious, so we
-  // saturate rather than average — many small risks and one big risk both matter.
   let score = Math.min(100, weighted);
-
-  // A malicious 7702 delegation is an account-takeover; force the ceiling.
   if (delegation?.malicious) score = Math.max(score, 95);
 
+  // Band is driven by the WORST confirmed finding, not the raw sum — so a wallet with
+  // many routine (medium) approvals isn't screamed at as CRITICAL.
   const band: RiskBand =
-    score >= 70 || delegation?.malicious
+    counts.critical > 0 || delegation?.malicious
       ? "CRITICAL"
-      : score >= 40
+      : counts.high > 0
         ? "HIGH"
-        : score >= 15
+        : counts.medium > 0
           ? "ELEVATED"
           : "LOW";
 

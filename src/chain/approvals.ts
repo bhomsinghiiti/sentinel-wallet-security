@@ -10,6 +10,9 @@
 
 import { rpcCall } from "./rpc.ts";
 import { discoverViaEtherscan, isPermit2, type DiscoveredPair } from "./etherscan.ts";
+import { lookupKnown } from "../core/allowlist.ts";
+import { addressReputation, tokenReputation } from "./reputation.ts";
+import { getPrices } from "./prices.ts";
 import type { Approval } from "../core/types.ts";
 
 const TOPIC_APPROVAL = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
@@ -43,52 +46,115 @@ export async function liveApprovals(owner: string): Promise<Approval[] | null> {
   return verifyPairs(owner, pairs);
 }
 
-/** Phase-2 verification: read the CURRENT allowance for each candidate; drop dead ones.
- *  NOTE: in v0.1 every live spender is marked verified:false / flagged:false /
- *  knownDrainer:false — there is no reputation source wired yet (that's Phase 1), so the
- *  `flagged`/`knownDrainer` risk rules only fire on fixture data, not live scans. */
+/** Phase-2: read CURRENT allowance for each candidate; drop dead ones; then ENRICH
+ *  each with the allowlist (trusted contracts), reputation (GoPlus drainer/honeypot),
+ *  and USD value-at-risk (balanceOf × DefiLlama price). This is the judgment layer. */
 async function verifyPairs(owner: string, pairs: DiscoveredPair[]): Promise<Approval[]> {
-  const out: Approval[] = [];
+  const base: { a: Approval; rawAllowance: bigint }[] = [];
 
+  // --- current-state verification (keep only live approvals) ---
   for (const { kind, token, spender } of pairs.slice(0, 60)) {
     try {
       if (kind === "erc20") {
         const data = SEL_ALLOWANCE + pad32(owner) + pad32(spender);
         const res = (await rpcCall("eth_call", [{ to: token, data }, "latest"])) as string;
         const val = toBigInt(res);
-        if (val === null || val === 0n) continue; // allowance 0 / unreadable → revoked/spent
-        // Treat anything ≥ 2^255 as effectively unlimited (covers 2^256-1 and near-max sentinels).
+        if (val === null || val === 0n) continue;
         const unlimited = val >= 1n << 255n;
-        out.push({
-          kind: "erc20",
-          asset: await safeSymbol(token),
-          spender: { address: spender, verified: false, flagged: false, knownDrainer: false, permit2: isPermit2(spender) },
-          unlimited,
-          allowance: unlimited ? "Unlimited" : `${shortHex(res)} (raw)`,
-          lastUsedDaysAgo: null,
-          exposureUsd: 0,
+        base.push({
+          rawAllowance: val,
+          a: {
+            kind: "erc20", asset: await safeSymbol(token), token,
+            spender: { address: spender, verified: false, flagged: false, knownDrainer: false, permit2: isPermit2(spender) },
+            unlimited, allowance: unlimited ? "Unlimited" : `${shortHex(res)} (raw)`,
+            lastUsedDaysAgo: null, exposureUsd: 0,
+          },
         });
       } else {
         const data = SEL_IS_APPROVED_FOR_ALL + pad32(owner) + pad32(spender);
         const res = (await rpcCall("eth_call", [{ to: token, data }, "latest"])) as string;
-        // isApprovedForAll returns a 32-byte ABI bool; decode the whole word, not the last nibble.
         const approved = toBigInt(res);
-        if (approved === null || approved === 0n) continue; // not approved-for-all anymore
-        out.push({
-          kind: "nft",
-          asset: await safeSymbol(token),
-          spender: { address: spender, verified: false, flagged: false, knownDrainer: false },
-          unlimited: true,
-          allowance: "ALL NFTs",
-          lastUsedDaysAgo: null,
-          exposureUsd: 0,
+        if (approved === null || approved === 0n) continue;
+        base.push({
+          rawAllowance: 1n << 255n,
+          a: {
+            kind: "nft", asset: await safeSymbol(token), token,
+            spender: { address: spender, verified: false, flagged: false, knownDrainer: false },
+            unlimited: true, allowance: "ALL NFTs", lastUsedDaysAgo: null, exposureUsd: 0,
+          },
         });
       }
     } catch {
       /* skip this pair */
     }
   }
+
+  await enrich(owner, base);
+  return base.map((b) => b.a);
+}
+
+/** Attach trusted-contract labels, drainer/honeypot reputation, and USD value-at-risk. */
+async function enrich(owner: string, base: { a: Approval; rawAllowance: bigint }[]): Promise<void> {
+  // 1. Allowlist (sync, offline): known protocols → verified + label.
+  for (const { a } of base) {
+    const known = lookupKnown(a.spender.address);
+    if (known) {
+      a.spender.verified = true;
+      a.spender.label = a.spender.label ?? `${known.name}: ${known.label}`;
+    }
+  }
+
+  const spenders = [...new Set(base.map((b) => b.a.spender.address))].slice(0, 40);
+  const erc20Tokens = [...new Set(base.filter((b) => b.a.kind !== "nft").map((b) => b.a.token))].slice(0, 40);
+
+  // 2. Reputation + prices + balances, in parallel.
+  const [repBySpender, priceByToken, balByToken, hpByToken] = await Promise.all([
+    mapAsync(spenders, (s) => addressReputation(s)),
+    getPrices(erc20Tokens),
+    mapAsync(erc20Tokens, (t) => balanceOf(owner, t)),
+    mapAsync(erc20Tokens, (t) => tokenReputation(t)),
+  ]);
+
+  for (const { a, rawAllowance } of base) {
+    const rep = repBySpender.get(a.spender.address);
+    if (rep?.malicious) {
+      a.spender.knownDrainer = true;
+      a.spender.flagged = true;
+      a.spender.label = `⚠ ${rep.reasons.join(", ")}`;
+      a.spender.verified = false;
+    }
+    if (a.kind !== "nft") {
+      if (hpByToken.get(a.token)?.honeypot) a.honeypot = true;
+      const price = priceByToken.get(a.token.toLowerCase());
+      const bal = balByToken.get(a.token);
+      if (price && bal !== undefined && bal !== null) {
+        const exposedRaw = rawAllowance < bal ? rawAllowance : bal; // min(allowance, balance)
+        a.exposureUsd = (Number(exposedRaw) / 10 ** price.decimals) * price.price;
+      }
+    }
+  }
+}
+
+/** Run an async fn over keys, returning a Map<key, result>. Bounded concurrency. */
+async function mapAsync<T>(keys: string[], fn: (k: string) => Promise<T>): Promise<Map<string, T>> {
+  const out = new Map<string, T>();
+  const CONC = 8;
+  for (let i = 0; i < keys.length; i += CONC) {
+    const slice = keys.slice(i, i + CONC);
+    const results = await Promise.all(slice.map(fn));
+    slice.forEach((k, j) => out.set(k, results[j]));
+  }
   return out;
+}
+
+const SEL_BALANCE_OF = "0x70a08231"; // balanceOf(address)
+async function balanceOf(owner: string, token: string): Promise<bigint | null> {
+  try {
+    const res = (await rpcCall("eth_call", [{ to: token, data: SEL_BALANCE_OF + pad32(owner) }, "latest"])) as string;
+    return toBigInt(res);
+  } catch {
+    return null;
+  }
 }
 
 /** Fallback discovery via raw eth_getLogs (free RPCs usually reject full history → null). */

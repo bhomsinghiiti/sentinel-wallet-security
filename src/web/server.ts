@@ -7,6 +7,7 @@
 
 import { createServer } from "node:http";
 import { scoreWallet } from "../core/risk.ts";
+import { buildRevoke } from "../core/revoke.ts";
 import { liveScan } from "../chain/scan.ts";
 import { liveApprovals } from "../chain/approvals.ts";
 import { SAMPLE_APPROVALS } from "../fixtures/sampleWallet.ts";
@@ -51,8 +52,10 @@ const server = createServer(async (req, res) => {
         }
       }
       const report = scoreWallet(address, approvals, delegation);
+      // Attach the (tested, pure) revoke calldata per finding so the browser only signs.
+      const findings = report.findings.map((f) => ({ ...f, revoke: buildRevoke(f.approval) }));
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ report, source }));
+      res.end(JSON.stringify({ report: { ...report, findings }, source }));
     } catch (e) {
       // Log the detail server-side; never return it — RPC errors can contain a
       // keyed endpoint URL. The client gets a generic message.
@@ -103,6 +106,10 @@ button:hover{filter:brightness(1.1)}
 .chip{font-family:var(--mono);font-size:10px;font-weight:700;padding:4px 8px;border-radius:6px;text-transform:uppercase;white-space:nowrap;flex:none;width:64px;text-align:center}
 .c-critical{color:var(--crit);background:#2e1416}.c-high{color:var(--high);background:#2c1d0e}.c-medium{color:var(--med);background:#272109}.c-low{color:var(--low);background:#0e2a1d}
 .row .a{font-weight:700}.row .s{color:var(--dim);font-size:12px;font-family:var(--mono)}.row .r{color:var(--dim);font-size:13px;margin-top:3px}
+.row .mid{flex:1;min-width:0}.row .ex{color:var(--high);font-weight:700;font-size:12px;font-family:var(--mono)}
+.rev{flex:none;align-self:center;font-weight:700;font-size:12.5px;border:1px solid var(--line2);background:var(--bg3);color:var(--text);border-radius:8px;padding:7px 13px;cursor:pointer}
+.rev:hover{border-color:var(--crit);color:var(--crit)}.rev:disabled{cursor:default;opacity:.8}
+.rev.done{border-color:var(--low);color:var(--low);background:var(--low)10}
 .src{font-size:12px;color:var(--dim);margin:14px 0;padding:9px 12px;border:1px dashed var(--line);border-radius:8px}
 .err{color:var(--crit)}.spin{color:var(--acc)}
 .foot{margin-top:26px;font-size:12px;color:#647085;line-height:1.5}
@@ -127,6 +134,18 @@ document.getElementById('connect').onclick=async()=>{
 };
 document.getElementById('scan').onclick=scan;
 addr.addEventListener('keydown',e=>{if(e.key==='Enter')scan();});
+// One-click revoke — user signs in their own wallet; we only hand over the calldata.
+out.addEventListener('click',async e=>{
+  const b=e.target.closest('.rev'); if(!b) return;
+  if(!window.ethereum){alert('No wallet found — install MetaMask to revoke.');return;}
+  const old=b.textContent;
+  try{
+    const accs=await window.ethereum.request({method:'eth_requestAccounts'});
+    b.disabled=true;b.textContent='Confirm in wallet…';
+    await window.ethereum.request({method:'eth_sendTransaction',params:[{from:accs[0],to:b.dataset.to,data:b.dataset.data}]});
+    b.textContent='Revoked ✓';b.classList.add('done');
+  }catch(err){b.disabled=false;b.textContent=old;alert('Revoke cancelled/failed: '+ESC(err.message||String(err)));}
+});
 async function scan(){
   const a=addr.value.trim();
   if(!/^0x[0-9a-fA-F]{40}$/.test(a)){out.innerHTML='<p class="err">Enter a valid 0x address.</p>';return;}
@@ -153,9 +172,11 @@ function render(r,source){
   if(source==='demo')h+='<div class="src">This is <b>sample data</b> showing what a messy wallet looks like — not a real wallet. (Add <code>?demo=1</code> triggered this view.)</div>';
   if(source==='live')h+='<div class="src">✓ <b>Live</b> approvals read from chain for this wallet.</div>';
   for(const f of r.findings.filter(f=>f.approval.kind!=='delegation')){
-    h+='<div class="row"><span class="chip c-'+f.level+'">'+f.level+'</span><div>'+
-      '<span class="a">'+ESC(f.approval.asset)+'</span> <span class="s">→ '+ESC(f.approval.spender.label||f.approval.spender.address)+' ['+ESC(f.approval.allowance)+']</span>'+
-      '<div class="r">'+ESC(f.reason)+'</div></div></div>';
+    const ex=f.approval.exposureUsd>0?' · <span class="ex">$'+Math.round(f.approval.exposureUsd).toLocaleString()+' at risk</span>':'';
+    const btn=f.revoke?'<button class="rev" data-to="'+ESC(f.revoke.to)+'" data-data="'+ESC(f.revoke.data)+'">Revoke</button>':'';
+    h+='<div class="row"><span class="chip c-'+f.level+'">'+f.level+'</span>'+
+      '<div class="mid"><span class="a">'+ESC(f.approval.asset)+'</span> <span class="s">→ '+ESC(f.approval.spender.label||f.approval.spender.address)+' ['+ESC(f.approval.allowance)+']</span>'+ex+
+      '<div class="r">'+ESC(f.reason)+'</div></div>'+btn+'</div>';
   }
   if(!r.findings.length && (source==='clean'||source==='live'||source==='demo'))h+='<p class="note">No open approvals or delegations found — this wallet looks clean. ✓</p>';
   if(!r.findings.length && source==='unavailable')h+='<p class="note">No EIP-7702 delegation found (live ✓). Approvals not read — add a data key above to see them.</p>';

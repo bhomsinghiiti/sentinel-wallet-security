@@ -31,6 +31,8 @@ export interface Approval {
   kind: ApprovalKind;
   /** Token symbol for approvals, or "ACCOUNT" for a 7702 delegation. */
   asset: string;
+  /** The token / collection contract address (the target of a revoke tx). */
+  token: string;
   spender: Spender;
   /** True when the allowance is the max uint256 ("Unlimited"). */
   unlimited: boolean;
@@ -40,6 +42,8 @@ export interface Approval {
   lastUsedDaysAgo: number | null;
   /** Best-effort USD exposed if this approval were fully drained. */
   exposureUsd: number;
+  /** The approved token itself is a honeypot/scam token (GoPlus). */
+  honeypot?: boolean;
 }
 
 /** The engine's verdict on one approval. */
