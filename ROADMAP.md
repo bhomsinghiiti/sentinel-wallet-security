@@ -24,13 +24,13 @@ engine, and (b) we can detect a 7702 delegation from a real on-chain read.
 
 - [x] Pure, dependency-free **risk engine** (`src/core/risk.ts`) — classifies every
       approval into critical/high/medium/low with a plain-language reason, and scores
-      the wallet 0–100. 12 rules, fully unit-tested.
+      the wallet 0–100. fully unit-tested.
 - [x] **EIP-7702 delegation detector** (`src/core/delegation.ts`) — parses
       `eth_getCode` (`0xef0100 || <delegate>`), flags known sweepers. The wedge.
 - [x] **Live on-chain read** (`src/chain/`) — raw JSON-RPC over `fetch`, zero deps;
       `--live <addr>` detects real delegations (verified live against mainnet).
 - [x] Realistic **fixture wallet** + terminal **report renderer**.
-- [x] **22 passing tests** (`node --test`), no external dependencies, runs on Node ≥22.6.
+- [x] **29 passing tests** (`node --test`), no external dependencies, runs on Node ≥22.6.
 
 **Advance metric:** ✅ `npm test` green + a real on-chain delegation detected.
 
@@ -87,7 +87,7 @@ any 7702 delegation, and **revoke** in a transaction the user signs.
 ## Run it
 
 ```sh
-npm test            # 22 tests, no install needed (Node ≥22.6)
+npm test            # 29 tests, no install needed (Node ≥22.6)
 npm run scan        # offline demo on the sample wallet
 node src/cli/scan.ts --live 0xYourAddress   # real on-chain 7702 check
 ```

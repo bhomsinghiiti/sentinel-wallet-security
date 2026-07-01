@@ -67,6 +67,13 @@ cp .env.example .env        # put your key in ETHERSCAN_KEY
 ETHERSCAN_KEY=your_key PORT=7702 npm run web
 ```
 
+> **Scope (honest):** Sentinel is a **self-run local tool** (a CLI + a `127.0.0.1` web
+> server) — you clone and run it yourself; it is not a hosted service you visit by link.
+> **Ethereum mainnet only** for now. Heavy wallets take ~40–60s to scan (batched
+> `Multicall3` reads are on the roadmap), and Permit2 *inner* allowances are detected but
+> not yet enumerated. The `--live` CLI does the delegation check; full approval reading is
+> the web app.
+
 Open **http://localhost:7702**, paste an address (or connect a wallet, read-only), and scan.
 Discovery runs through Etherscan v2; current allowances are verified with keyless `eth_call`;
 reputation (GoPlus) and prices (DefiLlama) need **no key**. Verified live against mainnet.
